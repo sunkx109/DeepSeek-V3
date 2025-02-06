@@ -149,11 +149,15 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
         - For other cases, the function applies quantization to `x` and uses `fp8_gemm` for computation.
     """
     if weight.element_size() > 1:
+        # 如果weight的数据类型大于1字节,即BF16/FP16/FP32等
+        # 直接调用 F.linear 来计算Linear
         return F.linear(x, weight, bias)
     elif gemm_impl == "bf16":
+        # 如果gemm实现模式是bf16，则先反量化weight 再计算gemm
         weight = weight_dequant(weight, weight.scale)
         return F.linear(x, weight, bias)
     else:
+        # 如果gemm实现模式是fp8，则先量化activation 再计算gemm
         x, scale = act_quant(x, block_size)
         y = fp8_gemm(x, scale, weight, weight.scale)
         if bias is not None:
@@ -179,6 +183,7 @@ class Linear(nn.Module):
         self.out_features = out_features
         self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype))
         if self.weight.element_size() == 1:
+            # 如果
             scale_out_features = (out_features + block_size - 1) // block_size
             scale_in_features = (in_features + block_size - 1) // block_size
             self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float32))
@@ -408,15 +413,15 @@ class MLA(nn.Module):
     """
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.dim = args.dim
-        self.n_heads = args.n_heads
+        self.dim = args.dim # 7168
+        self.n_heads = args.n_heads # 128
         self.n_local_heads = args.n_heads // world_size
-        self.q_lora_rank = args.q_lora_rank
-        self.kv_lora_rank = args.kv_lora_rank
-        self.qk_nope_head_dim = args.qk_nope_head_dim
-        self.qk_rope_head_dim = args.qk_rope_head_dim
-        self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
-        self.v_head_dim = args.v_head_dim
+        self.q_lora_rank = args.q_lora_rank # 1536
+        self.kv_lora_rank = args.kv_lora_rank # 512
+        self.qk_nope_head_dim = args.qk_nope_head_dim # 128
+        self.qk_rope_head_dim = args.qk_rope_head_dim # 64
+        self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim # 128 + 64 = 192
+        self.v_head_dim = args.v_head_dim # 128
 
         if self.q_lora_rank == 0:
             self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
@@ -456,18 +461,22 @@ class MLA(nn.Module):
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
         if self.q_lora_rank == 0:
+            # 不对q进行低秩分解
             q = self.wq(x)
         else:
-            q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+            # 对q进行低秩分解
+            q = self.wq_b(self.q_norm(self.wq_a(x))) # [bsz,seq_len,dim] -> [bsz ,seq_len ,q_lora_rank] -> [bsz,seq_len,n_heads*qk_head_dim]
+        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim) # [bsz,seq_len,n_heads*qk_head_dim]-> (bsz, seqlen, self.n_local_heads, self.qk_head_dim)
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1) 
+        # (bsz, seqlen, self.n_local_heads, self.qk_head_dim) -> (bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim) and (bsz, seqlen, self.n_local_heads, self.qk_rope_head_dim)
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
-        kv = self.wkv_a(x)
+        kv = self.wkv_a(x) # [bsz,seq_len,dim] -> [bsz,seq_len,self.kv_lora_rank + self.qk_rope_head_dim]
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        # [bsz,seq_len,self.kv_lora_rank + self.qk_rope_head_dim] -> [bsz,seq_len,self.kv_lora_rank] and [bsz,seq_len,self.qk_rope_head_dim]
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
         if attn_impl == "naive":
-            q = torch.cat([q_nope, q_pe], dim=-1)
-            kv = self.wkv_b(self.kv_norm(kv))
+            q = torch.cat([q_nope, q_pe], dim=-1) # concat q
+            kv = self.wkv_b(self.kv_norm(kv)) # 升维 K
             kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
@@ -552,9 +561,9 @@ class Gate(nn.Module):
         """
         super().__init__()
         self.dim = args.dim
-        self.topk = args.n_activated_experts
-        self.n_groups = args.n_expert_groups
-        self.topk_groups = args.n_limited_groups
+        self.topk = args.n_activated_experts # 8
+        self.n_groups = args.n_expert_groups # 8
+        self.topk_groups = args.n_limited_groups # 4
         self.score_func = args.score_func
         self.route_scale = args.route_scale
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
@@ -570,29 +579,45 @@ class Gate(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
-        scores = linear(x, self.weight)
+        # 1. 线性变换得到得分
+        scores = linear(x, self.weight) # (bsz*seq_len,dim) * (dim,args.n_routed_experts) -> (bsz*seq_len,args.n_routed_experts) 
+        # 经过矩阵乘法后，输出 scores 的形状为 (bsz*seq_len, args.n_routed_experts)
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1, dtype=torch.float32)
         else:
             scores = scores.sigmoid()
-        original_scores = scores
+        original_scores = scores  # (bsz*seq_len,args.n_routed_experts)
+        # 保存经过得分函数处理后的原始得分，后续会使用到
         if self.bias is not None:
             scores = scores + self.bias
         if self.n_groups > 1:
-            scores = scores.view(x.size(0), self.n_groups, -1)
+            # 如果专家组大于1
+            scores = scores.view(x.size(0), self.n_groups, -1)  # (bsz*seq_len,args.n_routed_experts) -> (bsz*seq_len, n_groups, args.n_routed_experts/n_groups)
             if self.bias is None:
-                group_scores = scores.amax(dim=-1)
+                # bias为None,则直接求得每组的最大score 
+                group_scores = scores.amax(dim=-1) # (bsz*seq_len, n_groups, args.n_routed_experts/n_groups) -> (bsz*seq_len, n_groups)
             else:
-                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+                # 否则,先求每组的top2 scores,然后将他们求和 
+                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1) # (bsz*seq_len, n_groups, args.n_routed_experts/n_groups) -> (bsz*seq_len, n_groups)
+            # 总之，group_scores 代表了各自组的得分
             indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+            # 然后取各个组得分的前self.topk_groups的索引
             mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
+            # 创建一个与 scores 的前两个维度相同的全零掩码矩阵
+            # scores[..., 0] 表示取 scores 的前两个维度，最后一个维度取第 0 个元素
+            # scatter_(1, indices, True) 表示在第 1 个维度上，根据 indices 中的索引位置将掩码矩阵对应位置的值设为 True
+            # 结果的形状为 [bsz*seq_len, n_groups]
             scores = (scores * mask.unsqueeze(-1)).flatten(1)
-        indices = torch.topk(scores, self.topk, dim=-1)[1]
-        weights = original_scores.gather(1, indices)
+            # 将掩码矩阵扩展一个维度,同时利用广播机制进行对mask进行拓展
+            # scores * mask.unsqueeze(-1) 表示将 scores 与掩码矩阵逐元素相乘，将不需要的得分置为 0
+            # flatten(1) 表示从第 1 个维度开始将矩阵展平，即合并第 1 个及以后的维度
+            # 结果的形状为 [bsz*seq_len, args.n_routed_experts]
+        indices = torch.topk(scores, self.topk, dim=-1)[1] # 再从剔除掉不重要group后的所有专家得分中 选择前self.topk个专家在整个args.n_routed_experts中索引
+        weights = original_scores.gather(1, indices) # 再根据索引从所有专家得分中获取对应的得分 [bsz*seq_len,n_routed_experts] -> [bsz*seq_len,self.topk]
         if self.score_func == "sigmoid":
-            weights /= weights.sum(dim=-1, keepdim=True)
-        weights *= self.route_scale
-        return weights.type_as(x), indices
+            weights /= weights.sum(dim=-1, keepdim=True) # 归一化
+        weights *= self.route_scale # 偏移
+        return weights.type_as(x), indices # [bsz*seq_len,self.topk] , [bsz*seq_len,self.topk]
 
 
 class Expert(nn.Module):
@@ -673,18 +698,25 @@ class MoE(nn.Module):
         Returns:
             torch.Tensor: Output tensor after expert routing and computation.
         """
-        shape = x.size()
-        x = x.view(-1, self.dim)
-        weights, indices = self.gate(x)
-        y = torch.zeros_like(x)
+        shape = x.size() # (bsz,seq_len,dim)
+        x = x.view(-1, self.dim) # (bsz*seq_len,dim)
+        weights, indices = self.gate(x) #[bsz*seq_len, 8]
+        y = torch.zeros_like(x) # 创建一个与输入 x 形状相同的全零张量 y，用于存储各专家的计算结果。
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
+        # 将索引张量 indices 展平，使用 torch.bincount 函数统计每个专家被选中的次数
+        # minlength=self.n_routed_experts 确保结果列表的长度至少为专家的数量
+        # 最后将结果转换为 Python 列表
         for i in range(self.experts_start_idx, self.experts_end_idx):
             if counts[i] == 0:
+                # 如果该专家没有被选中（即被选中的次数为 0），则跳过该专家的计算
                 continue
             expert = self.experts[i]
             idx, top = torch.where(indices == i)
+            # 找到所有被分配到当前专家的输入的索引
+            # idx 是这些输入在 x 中的行索引，top 是对应的权重索引
             y[idx] += expert(x[idx]) * weights[idx, top, None]
-        z = self.shared_experts(x)
+            # 执行每个专家的计算 同时×上对于的得分
+        z = self.shared_experts(x) # 共享专家的计算
         if world_size > 1:
             dist.all_reduce(y)
         return (y + z).view(shape)
