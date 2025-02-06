@@ -183,7 +183,7 @@ class Linear(nn.Module):
         self.out_features = out_features
         self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype))
         if self.weight.element_size() == 1:
-            # 如果
+            # 如果weight的类型是FP8 那么按 block wise的方式进行量化
             scale_out_features = (out_features + block_size - 1) // block_size
             scale_in_features = (in_features + block_size - 1) // block_size
             self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float32))
@@ -476,19 +476,22 @@ class MLA(nn.Module):
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
         if attn_impl == "naive":
             q = torch.cat([q_nope, q_pe], dim=-1) # concat q
-            kv = self.wkv_b(self.kv_norm(kv)) # 升维 K
+            kv = self.wkv_b(self.kv_norm(kv)) # 升维 KV [bsz,seq_len,self.kv_lora_rank] -> [bsz,seq_len,self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim]
             kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-            k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
-            self.k_cache[:bsz, start_pos:end_pos] = k
-            self.v_cache[:bsz, start_pos:end_pos] = v
+            k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1) # 把不需要位置编码的K和V拆分出来
+            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1) # 因为k_pe 是多头共享，所以先拓展多头之后再将不需要位置编码的k concat到一起
+            # 此时k.shape  = [bsz,seq_len,n_local_heads,qk_nope_head_dim+qk_rope_head_dim]
+            self.k_cache[:bsz, start_pos:end_pos] = k # 写入K cache
+            self.v_cache[:bsz, start_pos:end_pos] = v # 写入V cache 这种情况下K 和 V cache的shape不一样
             scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
         else:
+            # 反量化wkv_b.weight
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
-            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
-            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
-            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim]) # 吸收kv的升维矩阵至q_nope
+            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv) # kv cache 共享相同的的latent数据
+            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2) # k cache所特需的位置编码信息,所有头的数据共享
+            # 需要位置编码的乘积结果 + 不需要位置编码的乘积结果
             scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
                       torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
         if mask is not None:
@@ -497,6 +500,7 @@ class MLA(nn.Module):
         if attn_impl == "naive":
             x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
         else:
+            # S * V
             x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
             x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
         x = self.wo(x.flatten(2))
