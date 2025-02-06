@@ -488,7 +488,7 @@ class MLA(nn.Module):
             # 反量化wkv_b.weight
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank) # [n_local_heads,(self.qk_nope_head_dim + self.v_head_dim),self.kv_lora_rank]
-            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim]) # 吸收kv的升维矩阵至q_nope
+            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim]) # 吸收k的升维矩阵至q_nope
             # (bsz, seqlen, n_local_heads, qk_nope_head_dim) * [n_local_heads, qk_nope_head_dim, kv_lora_rank] = [bsz,seqlen,n_local_heads,kv_lora_rank]
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv) # kv cache 共享相同的的latent数据
             self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2) # k cache所特需的位置编码信息,所有头的数据共享
@@ -505,6 +505,7 @@ class MLA(nn.Module):
             # S * V
             x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
             # [bsz,seqlen,n_local_heads,seqlen] * [bsz,seqlen,kv_lora_rank] = [bsz,seqlen,n_local_heads,kv_lora_rank]
+            # 吸收v的升维矩阵
             x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
             # [bsz,seqlen,n_local_heads,kv_lora_rank] * [n_local_heads, v_head_dim, kv_lora_rank] = [bsz,seqlen,n_local_heads,v_head_dim]
         x = self.wo(x.flatten(2))
