@@ -495,7 +495,8 @@ class MLA(nn.Module):
             # 需要位置编码的乘积结果 + 不需要位置编码的乘积结果
             scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
                       torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
-            # [bsz,seqlen,n_local_heads,kv_lora_rank] * [bsz,seqlen,kv_lora_rank] = [bsz,seqlen,n_local_heads,seqlen]
+            # [bsz,seqlen,n_local_heads,kv_lora_rank] * [bsz,seqlen,kv_lora_rank] = [bsz,seqlen,n_local_heads,seqlen] 
+            # [bsz,seqlen,n_local_heads,qk_rope_head_dim] * [bsz,seqlen,qk_rope_head_dim] = [bsz,seqlen,n_local_heads,seqlen] 
         if mask is not None:
             scores += mask.unsqueeze(1)
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
